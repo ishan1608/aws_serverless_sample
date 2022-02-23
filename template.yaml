@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS serverless sample
+
+# Global Parameters
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    Description: (required) Environment type
+    AllowedValues:
+      - temp
+      - dev
+  Origin:
+    Type: String
+    Default: http://localhost:3000
+    Description: (required) Domain/"Origin" for CORS
+    AllowedValues:
+      - http://localhost:3000
+      - http://localhost:3000
+
+# More info about Globals: https://github.com/awslabs/serverless-application-model/blob/master/docs/globals.rst
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 128
+    Runtime: python3.8
+    Environment:
+      Variables:
+        ALLOW_METHODS: 'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'
+        ALLOW_HEADERS: 'X-Amz-Date,X-Api-Key,X-Amz-Security-Token,X-Requested-With,X-Auth-Token,Referer,User-Agent,Origin,Content-Type,Authorization,Accept,Access-Control-Allow-Methods,Access-Control-Allow-Origin,Access-Control-Allow-Headers'
+        ALLOW_ORIGIN: !Sub '${Origin}'
+        ALLOW_CREDENTIALS: true
+        ENVIRONMENT: ${Environment}
+
+Resources:
+  # Open API
+  ASSOpenApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Sub ASS_${Environment}_open_api
+      Cors:
+        AllowMethods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+        AllowHeaders: "'X-Amz-Date,X-Api-Key,X-Amz-Security-Token,X-Requested-With,X-Auth-Token,Referer,User-Agent,Origin,Content-Type,Authorization,Accept,Access-Control-Allow-Methods,Access-Control-Allow-Origin,Access-Control-Allow-Headers'"
+        AllowOrigin: !Sub "'${Origin}'"
+        MaxAge: "'600'"
+        AllowCredentials: false
+
+  # Lambda function
+  ASSMainFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ASS_${Environment}_main
+      Handler: functions.common.app.lambda_handler
+      CodeUri: ./
+      Events:
+        RootPath:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ASSOpenApi
+            Path: /
+            Method: ANY
+        ProxyPath:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ASSOpenApi
+            Path: /{proxy+}
+            Method: ANY
+        CatchAllPath:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ASSOpenApi
+            Path: $default
+            Method: ANY
+
+  AuroraKMSCMK:
+    Type: 'AWS::KMS::Key'
+    DeletionPolicy: Retain
+    Properties:
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:ListGrants'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:CallerAccount': !Ref 'AWS::AccountId'
+                'kms:ViaService': !Sub 'rds.${AWS::Region}.amazonaws.com'
+
+  AuroraKMSCMKAlias:
+    Type: 'AWS::KMS::Alias'
+    DeletionPolicy: Retain
+    DependsOn: ['AuroraDBCluster']
+    Properties:
+      AliasName: !Sub 'alias/${AuroraDBCluster}'
+      TargetKeyId: !Ref AuroraKMSCMK
+
+  DBSubnetGroup:
+    Type: 'AWS::RDS::DBSubnetGroup'
+    Properties:
+      DBSubnetGroupDescription: !Ref 'AWS::StackName'
+      #      SubnetIds: !Split [ ',', { 'Fn::ImportValue': !Sub 'ASS-${Environment}-PrivateSubnets' } ]
+      SubnetIds:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ASSVPC
+      CidrBlock: 10.0.0.0/16
+      AvailabilityZone: us-east-1a
+      Tags:
+        - Key: Names
+          Value: ASS-PublicA
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ASSVPC
+      CidrBlock: 10.0.0.0/16
+      AvailabilityZone: us-east-1b
+      Tags:
+        - Key: Names
+          Value: ASS-PublicB
+
+  ClusterSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: !Ref 'AWS::StackName'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          #          SourceSecurityGroupId: { 'Fn::ImportValue': !Sub 'ASS-${Environment}-EnvironmentSecurityGroup' }
+          SourceSecurityGroupId: !Ref ASSSecurityGroup
+          Description: 'Access to environment security group'
+      #      VpcId: { 'Fn::ImportValue': !Sub 'ASS-${Environment}-VpcId' }
+      VpcId: !Ref ASSVPC
+
+  ASSVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.30.6.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  #      Tags:
+  #        - Key: name
+  #          Value: !Join [ '', [ 'ASS-', !Ref Environment, "-VPC" ] ]
+
+  ASSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for RDS databases
+      GroupName: ASSSecurityGroup
+      VpcId: !Ref ASSVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+
+  DBClusterParameterGroup:
+    Type: 'AWS::RDS::DBClusterParameterGroup'
+    Properties:
+      Description: !Ref 'AWS::StackName'
+      Family: 'aurora-postgresql10'
+      Parameters:
+        client_encoding: 'UTF8'
+
+  AuroraMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Join [ '/', [ 'ASS', !Ref Environment, 'rds-database', 'aurora-pg' ] ]
+      Description: !Join [ '', [ 'Aurora PostgreSQL Master User Secret ', 'for CloudFormation Stack ', !Ref 'AWS::StackName' ] ]
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "postgres"}'
+        GenerateStringKey: "password"
+        ExcludeCharacters: '"@/\'
+        PasswordLength: 16
+
+  SecretAuroraClusterAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref AuroraMasterSecret
+      TargetId: !Ref AuroraDBCluster
+      TargetType: AWS::RDS::DBCluster
+
+  AuroraDBCluster:
+    Type: 'AWS::RDS::DBCluster'
+    Properties:
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref AuroraMasterSecret, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref AuroraMasterSecret, ':SecretString:password}}' ]]
+      DatabaseName: 'votes'
+      Engine: aurora-postgresql
+      EngineVersion: '10.7'
+      EngineMode: serverless
+      StorageEncrypted: true
+      KmsKeyId: !Ref AuroraKMSCMK
+      DBClusterParameterGroupName: !Ref DBClusterParameterGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref ClusterSecurityGroup
+      ScalingConfiguration:
+        AutoPause: true
+        MinCapacity: 2
+        MaxCapacity: 8
+        SecondsUntilAutoPause: 1000
+
+Outputs:
+  Origin:
+    Description: "Domain configured as allowed Origin"
+    Value: !Sub '${Origin}'
+  ASSOpenApi:
+    Description: "Open API Gateway endpoint URL"
+    Value: !Sub "https://${ASSOpenApi}.execute-api.${AWS::Region}.amazonaws.com/ASS_${Environment}_open_api"
+  RdsEndpoint: # injected as RDS_ENDPOINT environment variable by Copilot.
+    Description: 'The connection endpoint for the DB cluster.'
+    Value: !GetAtt 'AuroraDBCluster.Endpoint.Address'
+  RdsSecret: # injected as RDS_SECRET environment variable by Copilot.
+    Description: 'The secret that username and password.'
+    Value: !Ref AuroraMasterSecret
